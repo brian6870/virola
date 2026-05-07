@@ -1,0 +1,100 @@
+{
+  "manifest_version": 3,
+  "name": "Virola",
+  "version": "16.0.0",
+  "description": "Real-time streaming agentic coding assistant bridge. Captures AI responses via SSE streaming and writes files through a local server. Supports ChatGPT, Claude, Gemini, DeepSeek, Qwen, and more.",
+  "permissions": [
+    "activeTab",
+    "clipboardRead",
+    "clipboardWrite",
+    "notifications",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://chat.openai.com/*",
+    "*://*.chatgpt.com/*",
+    "*://chatgpt.com/*",
+    "*://*.anthropic.com/*",
+    "*://*.claude.ai/*",
+    "*://claude.ai/*",
+    "*://chat.deepseek.com/*",
+    "*://*.deepseek.com/*",
+    "*://*.gemini.google.com/*",
+    "*://gemini.google.com/*",
+    "*://aistudio.google.com/*",
+    "*://*.qwen.ai/*",
+    "*://qwen.ai/*",
+    "*://*.tongyi.aliyun.com/*",
+    "*://*.baidu.com/*",
+    "*://*.moonshot.cn/*",
+    "*://*.groq.com/*",
+    "*://groq.com/*",
+    "*://*.perplexity.ai/*",
+    "*://perplexity.ai/*",
+    "*://*.cohere.com/*",
+    "*://cohere.com/*",
+    "*://*.mistral.ai/*",
+    "*://mistral.ai/*",
+    "http://localhost:3172/*",
+    "http://127.0.0.1:3172/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://chat.openai.com/*",
+        "*://*.chatgpt.com/*",
+        "*://chatgpt.com/*",
+        "*://*.anthropic.com/*",
+        "*://*.claude.ai/*",
+        "*://claude.ai/*",
+        "*://chat.deepseek.com/*",
+        "*://*.deepseek.com/*",
+        "*://*.gemini.google.com/*",
+        "*://gemini.google.com/*",
+        "*://aistudio.google.com/*",
+        "*://*.qwen.ai/*",
+        "*://qwen.ai/*",
+        "*://*.tongyi.aliyun.com/*",
+        "*://*.moonshot.cn/*",
+        "*://*.groq.com/*",
+        "*://groq.com/*",
+        "*://*.perplexity.ai/*",
+        "*://perplexity.ai/*",
+        "*://*.cohere.com/*",
+        "*://cohere.com/*",
+        "*://*.mistral.ai/*",
+        "*://mistral.ai/*"
+      ],
+      "js": [
+        "content-scripts/stream-capture.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Virola v15 - AI Coding Assistant Bridge",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["stream-visualizer.html", "prompt.md"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "virola-server",
+  "version": "17.0.0",
+  "description": "Virola v17 - Node.js server detection, live bg output streaming, OpenAI-compatible endpoint",
+  "main": "server.js",
+  "bin": {
+    "virola": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev":   "node server.js --auto-approve"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}
