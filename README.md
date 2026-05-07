@@ -1,78 +1,91 @@
-# Virola v17.0
+# Virola
 
-Real-time AI coding bridge — detects bash commands in AI responses and executes them instantly.
+Virola is a local AI execution bridge for developer chat UIs. It detects bash/sh commands in AI responses, executes them against your local workspace, and streams live output back to the chat.
 
-## What's new in v17
+The project includes:
 
-- **Node.js server detection** — `node server.js`, `npm start`, `npm run dev`, `npx vite`, `npx next dev`, `nodemon`, `bun run`, `deno serve`, and more now automatically spawn in the background instead of blocking the main server
-- **Live output streaming** — after a background process starts, all subsequent stdout/stderr is forwarded as `bg_process_output` SSE events back to the chat in real time, so you see errors and health messages as they happen
+- `files/server.js` — the main Node.js server and OpenAI-compatible chat endpoint
+- `files/package.json` — install and run scripts
+- `chrome-extension/` — browser extension for forwarding AI responses and receiving execution results
 
-## What's new in v16
+## Features
 
-- **Chat architecture removed** — no more `/inject`, `/chat-events`, `/extension-status`, `chat.js`
-- **OpenAI-compatible endpoint** — point any third-party chat UI at `http://localhost:3172/v1/chat/completions`
-- **Bash auto-detection** — commands in ```bash``` / ```sh``` fences execute automatically, no `// COMMAND:` prefix needed
-- **Fast execution** — direct `spawnSync` with no timeouts; long-running servers spawn in background
-- **Python syntax check** — `.py` files validated before write; corrupt files are rejected
-- **Dedup guardrail** — pip/python/general commands only skipped after a prior SUCCESS
+- Executes shell commands automatically from AI assistant responses
+- Detects long-running developer servers and streams stdout/stderr as live SSE events
+- Supports OpenAI-compatible `POST /v1/chat/completions`
+- Works with local chat UIs via the included Chrome extension
+- Supports `npm`, `npx`, `node`, `bun`, `deno`, and Python server detection
 
-## Quick start
+## Requirements
+
+- Node.js 16 or newer
+- Git (optional, only for repo workflows)
+
+## Installation
 
 ```bash
 cd files
-node server.js --auto-approve
+npm install
 ```
 
-Flags:
-- `--port 3172`     Port to listen on (default 3172)
-- `--dir /path`     Workspace root (default: parent of server.js)
-- `--auto-approve`  Execute all commands without prompting
+## Running Virola
 
-## Background process detection
+Start the server from the `files` folder:
 
-The following command patterns automatically run in a background tab and stream their output back live:
+```bash
+cd files
+npm run dev
+```
 
-| Runtime | Detected patterns |
-|---------|-------------------|
-| Python  | `python app.py`, `python -m uvicorn`, `python -m flask`, `python -m gunicorn`, `python -m http.server`, Django `manage.py` |
-| Node.js | `node server.js`, `node .`, `node src/index.js` (any `.js` target) |
-| npm / yarn / pnpm | `npm start`, `npm run start`, `npm run dev`, `npm run serve`, `yarn dev`, etc. |
-| npx     | `npx vite`, `npx next dev`, `npx ts-node`, `npx nodemon`, `npx tsx`, `npx serve`, `npx http-server`, `npx json-server`, `npx fastify`, `npx nest` |
-| Bun     | `bun run server.ts`, `bun run index.js` |
-| Deno    | `deno run`, `deno serve` |
+Or run the production start command:
 
-## SSE events
+```bash
+cd files
+npm start
+```
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `bg_process_started` | `{ label, pid, command, startupOutput }` | Fires after 3s startup window; includes initial stdout/stderr |
-| `bg_process_output`  | `{ label, pid, output }` | **New in v17** — fires for every stdout/stderr chunk after startup |
-| `bg_process_exited`  | `{ label, pid, exitCode }` | Process died or was killed |
-| `bg_process_killed`  | `{ label, pid }` | Killed via `/kill-process` |
+### Optional flags
 
-## OpenAI-compatible endpoint
+- `--port 3172` — server port (default: `3172`)
+- `--dir /path/to/workspace` — workspace root directory (default: parent of `server.js`)
+- `--auto-approve` — execute commands immediately without confirmation prompts
 
-Set any third-party chat UI base URL to: `http://localhost:3172`
+Example:
+
+```bash
+cd files
+node server.js --auto-approve --port 3172 --dir ..
+```
+
+## Usage
+
+1. Install dependencies in `files/`
+2. Start Virola with `npm run dev` or `node server.js`
+3. Point your AI chat UI to `http://localhost:3172`
+4. Use the Chrome extension in `chrome-extension/` to forward AI responses and receive execution updates
+
+## Endpoints
+
+- `GET  /health` — server health and status
+- `GET  /stream` — SSE event stream for browser extension
+- `POST /stream-chunk` — forward a streaming chunk
+- `POST /stream-end` — end stream and execute parsed actions
+- `POST /execute` — execute a single action
+- `GET  /files` — list workspace files
+- `POST /paste` — write file content
+- `POST /kill-process` — kill a background process
+- `GET  /processes` — list running background processes
+
+## OpenAI-compatible API
+
+Base URL: `http://localhost:3172`
 
 - `GET  /v1/models`
-- `POST /v1/chat/completions`  (stream: true/false supported)
+- `POST /v1/chat/completions`
 
-API Key: anything (ignored)
-Model: `virola-executor`
-
-## Other endpoints
-
-- `GET  /health`           Server status + stats
-- `GET  /stream`           SSE event stream (Chrome extension)
-- `POST /stream-chunk`     Forward streaming chunk
-- `POST /stream-end`       End of stream, parse + execute actions
-- `POST /execute`          Execute a single action
-- `GET  /files`            List workspace files
-- `POST /paste`            Write file by content
-- `POST /kill-process`     Kill background process by label or PID
-- `GET  /processes`        List running background processes
+The server accepts any API key value and uses model `virola-executor`.
 
 ## Chrome extension
 
-Load `chrome-extension/` as an unpacked extension to use with browser-based AI chat UIs.
-Supported: DeepSeek, ChatGPT, Claude, Gemini, Qwen, Groq, Perplexity, Moonshot.
+Load the `chrome-extension/` folder as an unpacked extension in Chrome/Edge.
+It supports browser-based AI chat UIs such as DeepSeek, ChatGPT, Claude, Gemini, Qwen, Groq, Perplexity, and Moonshot.
