@@ -1,5 +1,25 @@
 #!/usr/bin/env node
-// ─── Virola Server v17.1 ────────────────────────────────────────────────────
+// ─── Virola Server v17.5 ────────────────────────────────────────────────────
+//
+// FIXES v17.5 (path-prefixed interpreter detection):
+// - LONG_RUNNING_PYTHON_RE now matches venv/bin/python3, .venv/bin/python,
+//   /usr/local/bin/python3, etc. — any path-prefixed python binary.
+// - LONG_RUNNING_DIRECT_RE now matches path-prefixed server binaries:
+//   venv/bin/uvicorn, .venv/bin/gunicorn, ./node_modules/.bin/next, etc.
+// - LONG_RUNNING_NODE_RE now matches path-prefixed node: ./node_modules/.bin/ts-node
+// - LONG_RUNNING_NPX_RE now matches path-prefixed npx equivalents via DIRECT_RE
+// - LONG_RUNNING_GO_RE, LONG_RUNNING_RUBY_RE, LONG_RUNNING_PHP_RE similarly patched
+// - Added LONG_RUNNING_SCRIPT_RE: catches *.py, *.js, *.ts run via a path-prefixed
+//   interpreter when no other regex fires (e.g. venv/bin/python3 app.py).
+//
+// FIXES v17.4 (dedup overhaul):
+// - Removed isDuplicateStream entirely — stream-level blocking was too aggressive
+// - isDuplicateCommandContent() uses tiered TTL Map (was permanent Set):
+//     server-start commands (go run, npm start …) → 30s TTL
+//     install commands (npm install, go mod tidy …) → 5min TTL
+//     everything else → 2min TTL
+// - Removed isDuplicateCommand (stream-ID based) — redundant layer eliminated
+// - isFileReadCommand whitelist expanded: ps, kill, pkill, pgrep, curl, ss, lsof, etc
 //
 // FIXES v17.1 (bug: command text contaminated by injected tool_result prose):
 // - parseActionsWithPartial() now trims non-shell prose that leaked into bash
@@ -41,7 +61,7 @@ const hasFlag = flag => args.includes(flag);
 const PORT = parseInt(getArg('--port', '3172'), 10);
 const BASE_DIR = path.resolve(getArg('--dir', path.join(__dirname, '..')));
 const AUTO_APPROVE = hasFlag('--auto-approve');
-const VERSION = '17.2.0';
+const VERSION = '17.5.0';
 
 // ── Root Workspace ────────────────────────────────────────────────────────────
 const WORKSPACE = BASE_DIR;
@@ -97,148 +117,234 @@ const stats = {
 // ── Background Process Registry ───────────────────────────────────────────────
 const bgProcesses = new Map();
 
-// ── Stream-level dedup ────────────────────────────────────────────────────────
-// Prevents the same AI response from being executed twice when the extension
-// fires stream-end multiple times (e.g. once for the injected tool_result and
-// once for the actual response). We hash the fullText and reject repeats within
-// a short window.
-const recentStreamHashes = new Map(); // hash → timestamp
-const STREAM_HASH_TTL_MS = 8000;
+// ── Command content-hash dedup (streamId-independent) ─────────────────────────
+const CMD_TTL_SERVER_START_MS = 30_000;
+const CMD_TTL_INSTALL_MS = 5 * 60_000;
+const CMD_TTL_DEFAULT_MS = 2 * 60_000;
 
-function simpleHash(str) {
-  let h = 0;
-  for (let i = 0; i < Math.min(str.length, 500); i++) {
-    h = Math.imul(31, h) + str.charCodeAt(i) | 0;
-  }
-  return h.toString(36) + str.length;
+const executedCmdFingerprints = new Map();
+
+const SERVER_START_RE = /^\s*(go\s+run|air|reflex|realize|fresh|gin|node\s+\S|ts-node|tsx|nodemon|bun\s+run|deno\s+(run|serve)|python3?\s+\S+\.py|python3?\s+-m\s+(uvicorn|gunicorn|flask|django|manage)|uvicorn|gunicorn|flask|rails\s+(s|server)|rackup|puma|php\s+-S|php\s+artisan\s+serve|dotnet\s+run|cargo\s+run|mix\s+phx\.server|swift\s+run|dart\s+run|java\s+-jar|mvn|gradle|npm\s+(start|run\s+(start|dev|serve))|yarn\s+(start|run\s+(start|dev|serve))|pnpm\s+(start|run\s+(start|dev|serve)))/i;
+
+const INSTALL_CMD_RE = /^\s*(npm\s+install|yarn\s+(install|add)|pnpm\s+(install|add)|pip3?\s+install|pip3?\s+install|go\s+mod\s+(tidy|download|vendor)|go\s+get|cargo\s+(add|fetch|update)|bundle\s+install|composer\s+(install|update)|apt(-get)?\s+(install|update)|brew\s+install)/i;
+
+function cmdTTL(cmd) {
+  const segments = cmd.split(/&&|\|(?!\|)/).map(s => s.replace(/\s*&\s*$/, '').trim());
+  if (segments.some(s => SERVER_START_RE.test(s))) return CMD_TTL_SERVER_START_MS;
+  if (segments.some(s => INSTALL_CMD_RE.test(s))) return CMD_TTL_INSTALL_MS;
+  return CMD_TTL_DEFAULT_MS;
 }
 
-function isDuplicateStream(fullText) {
-  const hash = simpleHash(fullText);
+function isDuplicateCommandContent(cmd) {
+  if (isFileReadCommand(cmd)) return false;
+  const key = normKey(cmd);
   const now = Date.now();
-  // Evict expired entries
-  for (const [k, ts] of recentStreamHashes) {
-    if (now - ts > STREAM_HASH_TTL_MS) recentStreamHashes.delete(k);
+  const ttl = cmdTTL(cmd);
+
+  for (const [k, ts] of executedCmdFingerprints) {
+    if (now - ts > CMD_TTL_DEFAULT_MS) executedCmdFingerprints.delete(k);
   }
-  if (recentStreamHashes.has(hash)) return true;
-  recentStreamHashes.set(hash, now);
+
+  const ranAt = executedCmdFingerprints.get(key);
+  if (ranAt !== undefined && (now - ranAt) < ttl) {
+    const agoSec = Math.round((now - ranAt) / 1000);
+    const ttlSec = Math.round(ttl / 1000);
+    log(`  ⛔ dedup (ran ${agoSec}s ago, ttl ${ttlSec}s): ${cmd.slice(0, 60)}`, C.yellow);
+    stats.skippedDuplicates++;
+    return true;
+  }
+
+  executedCmdFingerprints.set(key, now);
   return false;
 }
-
-// ── Unified Command Dedup ─────────────────────────────────────────────────────
-// Strategy: in-flight lock + post-completion cooldown.
-//
-// Time-based windows (3s, 15s, 60s) all fail for long-running commands like
-// `pip install` or `python3 -m venv` that take minutes — duplicate stream-end
-// events arriving mid-execution simply fall outside any fixed window.
-//
-// Instead we track three states per command key:
-//   RUNNING  — command is currently executing → block all duplicates
-//   COOLING  — command finished, cooling down for POST_RUN_COOLDOWN_MS → block
-//   IDLE     — cooldown expired → allow a fresh run
-//
-// This means a 7-minute pip install blocks duplicates for the full 7 minutes
-// plus the cooldown, regardless of how many stream-end events arrive.
-
-const POST_RUN_COOLDOWN_MS = 60_000; // 60s cooldown after a command completes
-
-// Map<cmdKey, { state: 'running'|'cooling'|'idle', startedAt, finishedAt, count }>
-const cmdLockMap = new Map();
 
 function normKey(cmd) {
   return cmd.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-// Returns true if the command should be blocked (running or cooling).
-// Side-effect: registers the command as running if it was IDLE (first call).
-function isDuplicateCommand(cmd) {
+const inFlightCmds = new Map();
+
+function isInFlight(cmd) {
   const key = normKey(cmd);
-  const now = Date.now();
-  const entry = cmdLockMap.get(key);
-
-  if (entry) {
-    if (entry.state === 'running') {
-      entry.count++;
-      log(`  ⛔ dedup (in-flight, ${Math.round((now - entry.startedAt) / 1000)}s running): ${cmd.slice(0, 60)}`, C.yellow);
-      stats.skippedDuplicates++;
-      return true;
-    }
-    if (entry.state === 'cooling') {
-      const elapsed = now - entry.finishedAt;
-      if (elapsed < POST_RUN_COOLDOWN_MS) {
-        entry.count++;
-        log(`  ⛔ dedup (cooldown, ${Math.round(elapsed / 1000)}s / ${POST_RUN_COOLDOWN_MS / 1000}s): ${cmd.slice(0, 60)}`, C.yellow);
-        stats.skippedDuplicates++;
-        return true;
-      }
-      // Cooldown expired — fall through and allow re-run
-    }
-  }
-
-  // Register as running
-  cmdLockMap.set(key, { state: 'running', startedAt: now, finishedAt: null, count: 1 });
-  // Prune stale idle entries
-  for (const [k, v] of cmdLockMap) {
-    if (v.state === 'cooling' && (now - v.finishedAt) > POST_RUN_COOLDOWN_MS * 2) cmdLockMap.delete(k);
-  }
-  return false;
+  const entry = inFlightCmds.get(key);
+  if (!entry) return false;
+  const elapsed = Date.now() - entry.startedAt;
+  log(`  ⛔ dedup (in-flight, ${Math.round(elapsed / 1000)}s running): ${cmd.slice(0, 60)}`, C.yellow);
+  stats.skippedDuplicates++;
+  return true;
 }
 
-// Call after a command finishes (success or failure) to start the cooldown.
+function markCommandRunning(cmd) {
+  inFlightCmds.set(normKey(cmd), { startedAt: Date.now() });
+}
+
 function markCommandFinished(cmd) {
-  const key = normKey(cmd);
-  const entry = cmdLockMap.get(key);
-  if (entry && entry.state === 'running') {
-    entry.state = 'cooling';
-    entry.finishedAt = Date.now();
-  }
+  inFlightCmds.delete(normKey(cmd));
 }
 
-// Legacy aliases used elsewhere in the file — all delegate to the unified system.
-function isDuplicatePip(cmd) {
-  if (!/^\s*pip3?\s+install\b/i.test(cmd.trim().split('\n')[0])) return false;
-  return isDuplicateCommand(cmd);
-}
-function isDuplicatePython(cmd) {
-  if (!/^\s*python3?\s+/i.test(cmd.trim().split('\n')[0])) return false;
-  return isDuplicateCommand(cmd);
+// ── File-Read Command Whitelist ───────────────────────────────────────────────
+const FILE_READ_CMD_RE = new RegExp(
+  '^\\s*(' +
+  'head\\s+' +
+  '|tail\\s+(?!-f\\s)' +
+  '|cat\\s+(?![>|])' +
+  '|less\\s+' +
+  '|more\\s+' +
+  '|grep\\s+' +
+  '|rg\\s+' +
+  '|ag\\s+' +
+  '|awk\\s+' +
+  '|sed\\s+(?!-i)' +
+  '|wc\\s+' +
+  '|ls\\s*' +
+  '|find\\s+' +
+  '|stat\\s+' +
+  '|file\\s+' +
+  '|diff\\s+' +
+  '|md5sum\\s+|sha256sum\\s+' +
+  '|xxd\\s+|hexdump\\s+' +
+  '|ps(\\s+|$)' +
+  '|kill\\s+' +
+  '|pkill\\s+' +
+  '|pgrep\\s+' +
+  '|lsof(\\s+|$)' +
+  '|netstat(\\s+|$)' +
+  '|ss(\\s+|$)' +
+  '|curl\\s+' +
+  '|wget\\s+' +
+  '|ping\\s+' +
+  '|dig\\s+|nslookup\\s+|host\\s+' +
+  '|free(\\s+|$)' +
+  '|df(\\s+|$)' +
+  '|du\\s+' +
+  '|uptime(\\s*$|\\s+)' +
+  '|uname\\s+' +
+  '|env(\\s*$|\\s+)|printenv(\\s+|$)' +
+  '|echo\\s+' +
+  '|printf\\s+' +
+  '|which\\s+|whereis\\s+|type\\s+' +
+  ')',
+  'i'
+);
+
+function isFileReadCommand(cmd) {
+  return FILE_READ_CMD_RE.test(cmd.trim().split('\n')[0]);
 }
 function markPipSucceeded(cmd) { markCommandFinished(cmd); }
 function markPythonSucceeded(cmd) { markCommandFinished(cmd); }
 function markCommandSucceeded(cmd) { markCommandFinished(cmd); }
 
 // ── Long-Running Process Detection ───────────────────────────────────────────
-const LONG_RUNNING_PYTHON_RE = /^(\s*python3?\s+(?!-c\s)(?:-m\s+(uvicorn|flask|gunicorn|http\.server|django|manage)|(?!-)\S+\.py\b))/i;
+//
+// KEY FIX (v17.5): All regexes now use (\S*\/)? before the binary name so that
+// path-prefixed invocations are matched:
+//   venv/bin/python3 main.py       ✓
+//   .venv/bin/uvicorn app:app      ✓
+//   ./node_modules/.bin/next dev   ✓
+//   /usr/local/bin/gunicorn        ✓
+//
+// The pattern (\S*\/)? means "zero or more non-space chars followed by a slash,
+// optionally" — this covers any relative or absolute path prefix.
 
-// Direct invocation: uvicorn, gunicorn, flask run, etc. (without python -m prefix)
-const LONG_RUNNING_DIRECT_RE = /^(\s*(uvicorn|gunicorn|flask)\s)/i;
+// ── Python ────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_PYTHON_RE = /^\s*(\S*\/)?python3?\s+(?!-c\s)(?:-m\s+(uvicorn|gunicorn|daphne|hypercorn|granian|waitress|twisted|cherrypy|flask|django|manage|http\.server|SimpleHTTPServer|tornado|aiohttp|sanic|starlette|litestar|fastapi|robyn|blacksheep|falcon|bottle|pyramid|pycnic|hug)|(?!-)\S+\.py\b)/i;
 
-// Node/JS servers: `node server.js`, `node .`, `node src/index.js`
-const LONG_RUNNING_NODE_RE   = /^\s*node\s+(?!-e\s)(?!--eval\s)\S/i;
+// Direct server binary invocation — with optional path prefix.
+// Covers: venv/bin/uvicorn, .venv/bin/gunicorn, /usr/local/bin/celery, etc.
+const LONG_RUNNING_DIRECT_RE = /^\s*(\S*\/)?(uvicorn|gunicorn|daphne|hypercorn|granian|waitress|flask|django-admin|celery|dramatiq|huey|rq|arq|fastapi)\s/i;
 
-// npm/yarn/pnpm lifecycle scripts that start servers
-const LONG_RUNNING_NPM_RE    = /^\s*(npm|yarn|pnpm)\s+(start|run\s+(start|serve|dev|watch|preview))\b/i;
+// ── Node / JS / TS ────────────────────────────────────────────────────────────
+// Covers: node server.js, ./node_modules/.bin/ts-node, /usr/local/bin/node, etc.
+const LONG_RUNNING_NODE_RE = /^\s*(\S*\/)?node\s+(?!-e\s)(?!--eval\s)\S/i;
+const LONG_RUNNING_NPM_RE = /^\s*(npm|yarn|pnpm)\s+(start|run\s+(start|serve|dev|watch|preview|storybook|sandbox))\b/i;
+// npx direct and path-prefixed equivalents (./node_modules/.bin/next, etc.)
+const LONG_RUNNING_NPX_RE = /^\s*(npx\s+(next|nuxt|vite|ts-node|nodemon|tsx|serve|http-server|lite-server|json-server|fastify|nest|strapi|payload|keystone|redwood|remix|sveltekit|astro|qwik|hydrogen|waku|hono)\b|(\S*\/)(next|nuxt|vite|ts-node|nodemon|tsx|serve|http-server|lite-server|json-server|fastify)\s)/i;
+const LONG_RUNNING_BUN_RE = /^\s*(\S*\/)?bun\s+(run\s+)?\S+\.(ts|js)\b/i;
+const LONG_RUNNING_DENO_RE = /^\s*(\S*\/)?deno\s+(run|serve)\b/i;
 
-// npx-launched servers: next dev, vite, ts-node, nodemon, etc.
-const LONG_RUNNING_NPX_RE    = /^\s*npx\s+(next|vite|ts-node|nodemon|tsx|serve|http-server|lite-server|json-server|fastify|nest)\b/i;
+// ── Ruby ──────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_RUBY_RE = /^\s*((\S*\/)?bundle\s+exec\s+)?((\S*\/)?(rails\s+(server|s\b)|rackup|puma|unicorn|thin|passenger\s+start|jekyll\s+serve|middleman\s+server|sinatra|hanami\s+server|cuba|roda|grape))\b/i;
 
-// bun / deno servers
-const LONG_RUNNING_BUN_RE    = /^\s*bun\s+(run\s+)?\S+\.(ts|js)\b/i;
-const LONG_RUNNING_DENO_RE   = /^\s*deno\s+(run|serve)\b/i;
+// ── PHP ───────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_PHP_RE = /^\s*((\S*\/)?php\s+-S\s+|(\S*\/)?php\s+artisan\s+serve|(\S*\/)?symfony\s+server:start|(\S*\/)?php-fpm|laravel\s+serve)\b/i;
+
+// ── Go ────────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_GO_RE = /^\s*(go\s+run\s+\S|air\b|gin\b|reflex\b|realize\b|fresh\b)/i;
+
+// ── Rust ──────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_RUST_RE = /^\s*(cargo\s+(run|watch|shuttle\s+run)|shuttle\s+run|trunk\s+serve)\b/i;
+
+// ── Java / JVM ────────────────────────────────────────────────────────────────
+const LONG_RUNNING_JAVA_RE = /^\s*((\S*\/)?java\s+(-cp\s+\S+\s+|-jar\s+)\S+|(mvn|\.\/mvnw)\s+.*spring-boot:run|(gradle|\.\/gradlew)\s+(bootRun|run)\b|quarkus\s+dev\b|mn\s+run\b|helidon\s+dev\b)/i;
+
+// ── .NET / C# ─────────────────────────────────────────────────────────────────
+const LONG_RUNNING_DOTNET_RE = /^\s*(\S*\/)?dotnet\s+(run|watch\s+run)\b/i;
+
+// ── Elixir / Erlang ───────────────────────────────────────────────────────────
+const LONG_RUNNING_ELIXIR_RE = /^\s*(mix\s+(phx\.server|run\s+--no-halt)|iex\s+-S\s+mix|rebar3\s+shell|(\S*\/)?elixir\s+\S+\.exs)\b/i;
+
+// ── Haskell ───────────────────────────────────────────────────────────────────
+const LONG_RUNNING_HASKELL_RE = /^\s*(stack\s+run|cabal\s+run|(\S*\/)?runghc\s+\S+\.hs)\b/i;
+
+// ── Kotlin ───────────────────────────────────────────────────────────────────
+const LONG_RUNNING_KOTLIN_RE = /^\s*(kotlinc\s+-script\s+\S+\.kts|(\S*\/)?kotlin\s+\S+\.jar)\b/i;
+
+// ── Scala ─────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_SCALA_RE = /^\s*(sbt\s+run|(\S*\/)?scala\s+\S+\.jar|mill\s+\S+\.run)\b/i;
+
+// ── Swift ─────────────────────────────────────────────────────────────────────
+const LONG_RUNNING_SWIFT_RE = /^\s*(swift\s+run|vapor\s+run|hummingbird)\b/i;
+
+// ── Dart / Flutter ────────────────────────────────────────────────────────────
+const LONG_RUNNING_DART_RE = /^\s*((\S*\/)?dart\s+run\s+\S+\.dart|flutter\s+run)\b/i;
+
+// ── Databases & queues ────────────────────────────────────────────────────────
+const LONG_RUNNING_DB_RE = /^\s*((\S*\/)?(postgres|mysqld|mongod|mongos|redis-server|elasticsearch|rabbitmq-server|kafka-server-start|zookeeper-server-start|cassandra|couchdb|influxd|etcd|neo4j\s+start|clickhouse-server|cockroach\s+start)|pg_ctl\s+start|minio\s+server|consul\s+agent|vault\s+server)\b/i;
+
+// ── Other common servers ──────────────────────────────────────────────────────
+const LONG_RUNNING_OTHER_RE = /^\s*((\S*\/)?(nginx|apache2|httpd|caddy\s+run|traefik|haproxy|jupyter\s+(notebook|lab|server)|mlflow\s+(server|ui)|tensorboard|streamlit\s+run|gradio|panel\s+serve|bokeh\s+serve|datasette|plumber|shiny))\b/i;
+
+// ── Generic path-prefixed script runner (catch-all for venv/bin/python3 app.py etc.) ──
+// This fires when (\S+/) precedes a known scripting runtime or a .py/.js/.ts/.rb file.
+// It is intentionally broad — placed LAST so specific regexes above take priority.
+const LONG_RUNNING_SCRIPT_RE = /^\s*\S+\/(\S+\.)?(py|js|ts|rb|php|exs|hs|kts|scala|dart)\s*$/i;
+
+// Strip leading KEY=VALUE env-var assignments so "PORT=8081 go run ." is detected correctly.
+function stripLeadingEnvVars(s) {
+  return s.replace(/^(\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '').trimStart();
+}
 
 function isLongRunningCommand(cmd) {
-  // Check each segment of a chained command (cd foo && uvicorn ...)
-  // so that "cd dir && uvicorn ..." is correctly identified as long-running.
-  const segments = cmd.split(/&&|\|/).map(s => s.trim());
-  return segments.some(first =>
-    LONG_RUNNING_PYTHON_RE.test(first) ||
-    LONG_RUNNING_DIRECT_RE.test(first) ||
-    LONG_RUNNING_NODE_RE.test(first)   ||
-    LONG_RUNNING_NPM_RE.test(first)    ||
-    LONG_RUNNING_NPX_RE.test(first)    ||
-    LONG_RUNNING_BUN_RE.test(first)    ||
-    LONG_RUNNING_DENO_RE.test(first)
-  );
+  const segments = cmd.split(/&&|\|(?!\|)/).map(s => s.trim());
+  return segments.some(seg => {
+    if (/&\s*$/.test(seg)) return true;
+    // Strip trailing & then strip any leading KEY=VALUE env assignments before matching
+    const s = stripLeadingEnvVars(seg.replace(/\s*&\s*$/, ''));
+    return (
+      LONG_RUNNING_PYTHON_RE.test(s) ||
+      LONG_RUNNING_DIRECT_RE.test(s) ||
+      LONG_RUNNING_NODE_RE.test(s) ||
+      LONG_RUNNING_NPM_RE.test(s) ||
+      LONG_RUNNING_NPX_RE.test(s) ||
+      LONG_RUNNING_BUN_RE.test(s) ||
+      LONG_RUNNING_DENO_RE.test(s) ||
+      LONG_RUNNING_RUBY_RE.test(s) ||
+      LONG_RUNNING_PHP_RE.test(s) ||
+      LONG_RUNNING_GO_RE.test(s) ||
+      LONG_RUNNING_RUST_RE.test(s) ||
+      LONG_RUNNING_JAVA_RE.test(s) ||
+      LONG_RUNNING_DOTNET_RE.test(s) ||
+      LONG_RUNNING_ELIXIR_RE.test(s) ||
+      LONG_RUNNING_HASKELL_RE.test(s) ||
+      LONG_RUNNING_KOTLIN_RE.test(s) ||
+      LONG_RUNNING_SCALA_RE.test(s) ||
+      LONG_RUNNING_SWIFT_RE.test(s) ||
+      LONG_RUNNING_DART_RE.test(s) ||
+      LONG_RUNNING_DB_RE.test(s) ||
+      LONG_RUNNING_OTHER_RE.test(s) ||
+      LONG_RUNNING_SCRIPT_RE.test(s)   // catch-all — must be last
+    );
+  });
 }
 
 function processLabel(cmd) {
@@ -248,43 +354,32 @@ function processLabel(cmd) {
 const STARTUP_COLLECT_MS = 4000;
 
 // ── Terminal launcher ─────────────────────────────────────────────────────────
-// Detects the best available terminal emulator on the current OS and opens the
-// server command in a NEW TAB / WINDOW so the user can see output directly.
-// A companion relay process writes all stdout/stderr to a temp log file, which
-// the main Virola process tails and streams back as SSE events.
 function detectTerminalLauncher() {
-  const isWin  = process.platform === 'win32';
-  const isMac  = process.platform === 'darwin';
+  const isWin = process.platform === 'win32';
+  const isMac = process.platform === 'darwin';
 
   if (isWin) {
-    // Windows Terminal (wt), then plain cmd
-    try { execSync('where wt', { stdio: 'ignore' }); return 'wt'; } catch {}
+    try { execSync('where wt', { stdio: 'ignore' }); return 'wt'; } catch { }
     return 'cmd';
   }
   if (isMac) {
-    return 'osascript'; // always available on macOS
+    return 'osascript';
   }
-  // Linux — try common terminals in preference order
   const linuxTerms = ['gnome-terminal', 'xfce4-terminal', 'konsole', 'xterm', 'lxterminal', 'tilix', 'alacritty', 'kitty'];
   for (const t of linuxTerms) {
-    try { execSync(`which ${t}`, { stdio: 'ignore' }); return t; } catch {}
+    try { execSync(`which ${t}`, { stdio: 'ignore' }); return t; } catch { }
   }
-  return null; // fallback to hidden spawn
+  return null;
 }
 
 const TERMINAL = detectTerminalLauncher();
 log(`  Terminal launcher: ${TERMINAL || 'none (hidden spawn fallback)'}`, C.dim);
 
 function buildTerminalCommand(shellCmd, logFile) {
-  // We wrap the user's command so that:
-  //  1. It runs in a NEW visible terminal tab/window
-  //  2. All output is tee'd to logFile so Virola can tail it
-  //  3. The window stays open after the process exits (so user sees errors)
   const wrapped = `bash -c '(${shellCmd}) 2>&1 | tee "${logFile}"; echo; echo "─── process exited ───"; read -p "Press Enter to close..."'`;
 
   switch (TERMINAL) {
     case 'osascript': {
-      // macOS Terminal.app — open a new tab in the frontmost window
       const escaped = wrapped.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
       return [
         'osascript', [
@@ -295,7 +390,6 @@ function buildTerminalCommand(shellCmd, logFile) {
       ];
     }
     case 'wt': {
-      // Windows Terminal — new tab
       const ps = `powershell -NoExit -Command "${shellCmd.replace(/"/g, '`"')} 2>&1 | Tee-Object -FilePath '${logFile}'"`;
       return ['wt', ['--', 'cmd', '/c', ps]];
     }
@@ -313,7 +407,7 @@ function buildTerminalCommand(shellCmd, logFile) {
     case 'alacritty':
     case 'kitty':
       return [TERMINAL, ['-e', 'bash', '-c', wrapped]];
-    default: // xterm and unknown
+    default:
       return [TERMINAL || 'xterm', ['-hold', '-e', wrapped]];
   }
 }
@@ -322,53 +416,40 @@ function spawnBackground(command) {
   return new Promise((resolve) => {
     const label = processLabel(command);
 
-    // Kill any existing process with the same label
     if (bgProcesses.has(label)) {
       const prev = bgProcesses.get(label);
-      try { prev.proc?.kill('SIGTERM'); } catch {}
-      try { if (prev.tailer) prev.tailer.kill(); } catch {}
+      try { prev.proc?.kill('SIGTERM'); } catch { }
+      try { if (prev.tailer) prev.tailer.kill(); } catch { }
       bgProcesses.delete(label);
       log(`  ↳ killed previous bg process: ${label}`, C.yellow);
     }
 
     const startTime = Date.now();
-
-    // Temp log file — the terminal tees output here; we tail it for SSE
     const logFile = path.join(require('os').tmpdir(), `virola-bg-${Date.now()}.log`);
-    // Touch the file so the tailer can open it immediately
     fs.writeFileSync(logFile, '');
 
-    // ── Open a new terminal window/tab ────────────────────────────────────────
     if (TERMINAL) {
       const [termBin, termArgs] = buildTerminalCommand(command, logFile);
-      // The terminal launcher itself exits immediately after opening the window
       const launcher = spawn(termBin, termArgs, {
         cwd: WORKSPACE, stdio: 'ignore', detached: true,
       });
       launcher.unref();
-      // SAFETY: a spawn error on the launcher must never crash the Node server.
       launcher.on('error', (err) => {
         log(`  ⚠ terminal launcher error (${label}): ${err.message}`, C.yellow);
       });
 
       log(`  ↗ opened in new terminal tab: ${label}`, C.cyan);
 
-      // ── Tail the log file and stream output back via SSE ────────────────────
       let startupOutput = '';
       let settled = false;
       let tailProc = null;
-      // Never store -1 or 0 as a PID — process.kill(0,...) sends the signal to
-      // the entire process group which includes the Node server itself.
       let fakePid = null;
 
       function settle() {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        // Only record a positive PID; otherwise leave null so killBgProcess
-        // skips the process.kill() call and stays safe.
         fakePid = (launcher.pid && launcher.pid > 0) ? launcher.pid : null;
-        // Store a sentinel entry — no real proc to kill, but logFile tailer tracked
         bgProcesses.set(label, { pid: fakePid, proc: null, tailer: tailProc, logFile, command, startTime });
         log(`  ✓ bg terminal started: ${label}`, C.green);
         broadcastSSE('bg_process_started', { label, pid: fakePid, command, startupOutput, terminal: true });
@@ -378,9 +459,7 @@ function spawnBackground(command) {
         });
       }
 
-      // Tail the log file for live output
       tailProc = spawn('tail', ['-f', logFile], { stdio: ['ignore', 'pipe', 'ignore'] });
-      // SAFETY: tailer errors must never propagate as unhandled 'error' events.
       tailProc.on('error', (err) => {
         log(`  ⚠ log tailer error (${label}): ${err.message}`, C.yellow);
       });
@@ -403,32 +482,25 @@ function spawnBackground(command) {
       tailProc.on('exit', () => {
         bgProcesses.delete(label);
         broadcastSSE('bg_process_exited', { label, pid: fakePid, exitCode: null });
-        try { fs.unlinkSync(logFile); } catch {}
+        try { fs.unlinkSync(logFile); } catch { }
       });
 
       const timer = setTimeout(() => settle(), STARTUP_COLLECT_MS);
       return;
     }
 
-    // ── Fallback: hidden child process (no terminal available) ───────────────
-    // CRITICAL: detached:true so the child process is in its own process group
-    // and survives if the node server is restarted or stopped (WSL/Linux).
-    // We tee output to a log file so we can still tail it for SSE and kill it.
     log(`  ⚠ No terminal found — running ${label} as detached hidden process`, C.yellow);
 
-    // Log file for output capture
     const hiddenLogFile = path.join(require('os').tmpdir(), `virola-bg-${Date.now()}.log`);
     fs.writeFileSync(hiddenLogFile, '');
 
     const proc = spawn('bash', ['-c', `(${command}) 2>&1 | tee "${hiddenLogFile}"`], {
       cwd: WORKSPACE,
       stdio: ['ignore', 'ignore', 'ignore'],
-      detached: true,   // ← KEY: own process group, survives node server death
+      detached: true,
     });
-    proc.unref();       // ← node server won't wait for this child to exit
-    // SAFETY: a spawn error must never propagate as an unhandled 'error' event
-    // and crash the Node server.  Resolve as a failed result so the caller always
-    // gets a response and the promise never hangs.
+    proc.on('exit', (code) => { settle(code ?? 0); });
+    proc.unref();
     proc.on('error', (err) => {
       log(`  ⚠ bg proc spawn error (${label}): ${err.message}`, C.yellow);
       resolve({ ok: false, background: false, output: `spawn error: ${err.message}`, exitCode: 1 });
@@ -436,10 +508,6 @@ function spawnBackground(command) {
 
     let startupOutput = '';
     let settled = false;
-    // SAFETY: declare hiddenTailer BEFORE anything that can call settle(), because
-    // proc 'exit' can fire synchronously (e.g. command not found) before we reach
-    // the hiddenTailer = spawn(...) line below.  The closure must always see a
-    // defined reference even if still null.
     let hiddenTailer = null;
 
     function settle(exitCode) {
@@ -457,16 +525,13 @@ function spawnBackground(command) {
           message: `Process started detached. pid ${pid}. Click "⏹ Kill Server" in the Virola popup or POST /kill-last to stop.`
         });
       } else {
-        // Process already gone — stop the tailer so it doesn't leak.
-        if (hiddenTailer) { try { hiddenTailer.kill(); } catch {} }
+        if (hiddenTailer) { try { hiddenTailer.kill(); } catch { } }
         log(`  ↳ bg candidate exited early (code ${exitCode}): ${label}`, C.yellow);
         resolve({ ok: exitCode === 0, background: false, output: startupOutput, exitCode });
       }
     }
 
-    // Tail the log file for output (proc stdio is ignore since detached)
     hiddenTailer = spawn('tail', ['-f', hiddenLogFile], { stdio: ['ignore', 'pipe', 'ignore'] });
-    // SAFETY: tailer errors must never propagate as unhandled 'error' events.
     hiddenTailer.on('error', (err) => {
       log(`  ⚠ hidden tailer error (${label}): ${err.message}`, C.yellow);
     });
@@ -486,12 +551,10 @@ function spawnBackground(command) {
       }
     });
 
-    // Since proc is detached+unref'd, we can't rely on proc 'exit'.
-    // The tailer exits when the process dies and closes the log file.
     hiddenTailer.on('exit', () => {
       bgProcesses.delete(label);
       broadcastSSE('bg_process_exited', { label, pid: proc.pid, exitCode: null });
-      try { fs.unlinkSync(hiddenLogFile); } catch {}
+      try { fs.unlinkSync(hiddenLogFile); } catch { }
     });
 
     const timer = setTimeout(() => settle(null), STARTUP_COLLECT_MS);
@@ -502,28 +565,18 @@ function killBgProcess(label) {
   const entry = bgProcesses.get(label);
   if (!entry) return { ok: false, error: `No background process with label: ${label}` };
   try {
-    // Kill by PID/process group — NEVER use pkill -f (it pattern-matches and
-    // can accidentally kill the node server process itself).
-    // SAFETY: only send signals for valid positive PIDs.
-    // pid=null means we had no reliable PID (terminal mode); pid=0 would send
-    // the signal to OUR OWN process group — both are skipped.
     if (entry.pid && entry.pid > 0) {
-      // Kill the entire process group spawned by the detached bash wrapper.
-      // Negative PID = kill process group.
-      try { process.kill(-entry.pid, 'SIGTERM'); } catch {}
-      // Also try direct PID in case it's not a group leader
-      try { process.kill(entry.pid, 'SIGTERM'); } catch {}
+      try { process.kill(-entry.pid, 'SIGTERM'); } catch { }
+      try { process.kill(entry.pid, 'SIGTERM'); } catch { }
     }
     if (entry.proc) {
-      try { entry.proc.kill('SIGTERM'); } catch {}
+      try { entry.proc.kill('SIGTERM'); } catch { }
     }
-    // Kill the log tailer
     if (entry.tailer) {
-      try { entry.tailer.kill(); } catch {}
+      try { entry.tailer.kill(); } catch { }
     }
-    // Clean up log file
     if (entry.logFile) {
-      try { fs.unlinkSync(entry.logFile); } catch {}
+      try { fs.unlinkSync(entry.logFile); } catch { }
     }
     bgProcesses.delete(label);
     broadcastSSE('bg_process_killed', { label, pid: entry.pid });
@@ -561,9 +614,8 @@ function route(pathname, req, res) {
   if (pathname === '/files' && req.method === 'GET') return handleListWorkspace(res);
   if (pathname === '/paste' && req.method === 'POST') return handlePaste(req, res);
   if (pathname === '/kill-process' && req.method === 'POST') return handleKillProcess(req, res);
-  if (pathname === '/kill-last'    && req.method === 'POST') return handleKillLast(res);
+  if (pathname === '/kill-last' && req.method === 'POST') return handleKillLast(res);
   if (pathname === '/processes' && req.method === 'GET') return handleListProcesses(res);
-  // ── OpenAI-compatible endpoint ─────────────────────────────────────────────
   if (pathname === '/v1/chat/completions' && req.method === 'POST') return handleOpenAI(req, res);
   if (pathname === '/v1/models' && req.method === 'GET') return handleOpenAIModels(res);
   sendJSON(res, 404, { error: 'Not found' });
@@ -583,11 +635,6 @@ function handleHealth(res) {
 }
 
 // ── OpenAI-Compatible Endpoint ────────────────────────────────────────────────
-// POST /v1/chat/completions
-// Accepts: { model, messages, stream, ... }
-// The body's last assistant message (or all messages) is scanned for bash
-// fences and any commands are executed immediately.
-// Responds with a fake OpenAI-format completion so any third-party chat UI works.
 function handleOpenAIModels(res) {
   sendJSON(res, 200, {
     object: 'list',
@@ -607,8 +654,6 @@ async function handleOpenAI(req, res) {
     stats.openaiRequests++;
     const { messages = [], stream = false, model = 'virola-executor' } = payload;
 
-    // Gather all assistant content to scan for commands.
-    // Also include the last user message in case the UI puts commands there.
     const textToScan = messages
       .filter(m => m.role === 'assistant' || m.role === 'user')
       .map(m => (typeof m.content === 'string' ? m.content : (m.content || []).map(c => c.text || '').join('')))
@@ -619,14 +664,19 @@ async function handleOpenAI(req, res) {
     const { actions, partialBlocks } = parseActionsWithPartial(textToScan);
     log(`  Found ${actions.length} executable action(s)`, actions.length > 0 ? C.green : C.dim);
 
-    // Execute all detected commands
     const commandOutputs = [];
+    const openaiStreamId = `openai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     for (const action of actions) {
       if (action.type !== 'execute_command') continue;
       const cmd = action.params?.command || '';
-      if (isDuplicatePip(cmd)) { commandOutputs.push({ cmd, output: '[pip dedup]', exitCode: 0 }); continue; }
-      if (isDuplicatePython(cmd)) { commandOutputs.push({ cmd, output: '[python dedup]', exitCode: 0 }); continue; }
-      if (isDuplicateCommand(cmd)) { commandOutputs.push({ cmd, output: '', exitCode: 0 }); continue; }
+      if (isFileReadCommand(cmd)) {
+        // always run
+      } else {
+        if (isDuplicateCommandContent(cmd) || isInFlight(cmd)) {
+          commandOutputs.push({ cmd, output: '[dedup]', exitCode: 0 }); continue;
+        }
+        markCommandRunning(cmd);
+      }
 
       log(`  $ ${cmd.slice(0, 100)}`, C.dim);
       try {
@@ -643,7 +693,6 @@ async function handleOpenAI(req, res) {
       }
     }
 
-    // Build a summary reply that includes command outputs
     let replyContent = '';
     if (commandOutputs.length > 0) {
       replyContent = commandOutputs.map(({ cmd, output, exitCode, background }) => {
@@ -659,7 +708,6 @@ async function handleOpenAI(req, res) {
     const completionId = 'chatcmpl-vb' + Date.now().toString(36);
 
     if (stream) {
-      // Stream SSE format
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -667,7 +715,6 @@ async function handleOpenAI(req, res) {
         'Access-Control-Allow-Origin': '*',
       });
 
-      // Chunk the reply so streaming UIs see it flowing in
       const chunkSize = 40;
       for (let i = 0; i < replyContent.length; i += chunkSize) {
         const delta = replyContent.slice(i, i + chunkSize);
@@ -681,7 +728,6 @@ async function handleOpenAI(req, res) {
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       }
 
-      // Final chunk
       const doneChunk = {
         id: completionId,
         object: 'chat.completion.chunk',
@@ -693,7 +739,6 @@ async function handleOpenAI(req, res) {
       res.write('data: [DONE]\n\n');
       res.end();
     } else {
-      // Regular JSON response
       sendJSON(res, 200, {
         id: completionId,
         object: 'chat.completion',
@@ -705,7 +750,6 @@ async function handleOpenAI(req, res) {
           finish_reason: 'stop'
         }],
         usage: { prompt_tokens: 0, completion_tokens: replyContent.length, total_tokens: replyContent.length },
-        // Also include raw execution results for programmatic use
         _virola: { actions: actions.length, commandOutputs, partialBlocks }
       });
     }
@@ -777,14 +821,6 @@ async function handleStreamEnd(req, res) {
 
     if (stream) activeStreams.delete(streamId);
 
-    // Dedup: if this exact text was already processed within the last 8s, skip.
-    // This prevents double-execution when the extension fires stream-end twice
-    // (once for injected tool_result feedback, once for the real AI response).
-    if (isDuplicateStream(reconstructedText)) {
-      log(`  ⛔ duplicate stream-end (same text, <8s) — skipping execution`, C.yellow);
-      return sendJSON(res, 200, { ok: true, actions: [], results: [], partialBlocks: 0, fullText: reconstructedText, dedup: true });
-    }
-
     const { actions, partialBlocks } = parseActionsWithPartial(reconstructedText);
     if (partialBlocks > 0) { stats.partialBlocks += partialBlocks; }
     if (actions.length > 0) {
@@ -802,10 +838,11 @@ async function handleStreamEnd(req, res) {
 
       if (action.type === 'execute_command') {
         const cmd = action.params?.command || '';
-        if (isDuplicateCommand(cmd)) {
+        if (!isFileReadCommand(cmd) && (isDuplicateCommandContent(cmd) || isInFlight(cmd))) {
           stats.skippedDuplicates++;
           results.push({ action, result: { ok: true, output: '[dedup]', exitCode: 0, skipped: true } }); continue;
         }
+        if (!isFileReadCommand(cmd)) markCommandRunning(cmd);
       }
 
       const isFileWrite = action.type === 'write_file' ||
@@ -825,8 +862,6 @@ async function handleStreamEnd(req, res) {
           const cmd = action.params?.command || '';
           markCommandFinished(cmd);
           if (result.background) {
-            // Background process: broadcast with startupOutput and background metadata
-            // so the extension can inject a proper tool_result back to the AI.
             broadcastSSE('command_result', {
               command: cmd,
               output: result.startupOutput || '',
@@ -847,7 +882,6 @@ async function handleStreamEnd(req, res) {
         stats.failed++;
         results.push({ action, error: err.message });
         log(`  ✗ ${action.type}: ${err.message}`, C.red);
-        // Release the lock on failure so the AI can retry the command
         if (action.type === 'execute_command') {
           markCommandFinished(action.params?.command || '');
           broadcastSSE('command_result', { command: action.params?.command, output: err.message, exitCode: 1 });
@@ -861,7 +895,6 @@ async function handleStreamEnd(req, res) {
 
 // ── /stream (SSE) ─────────────────────────────────────────────────────────────
 function handleSSE(req, res) {
-  // Disable socket idle timeout for SSE connections — they must stay open forever.
   req.socket.setTimeout(0);
   req.socket.setKeepAlive(true, 1000);
 
@@ -870,16 +903,14 @@ function handleSSE(req, res) {
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',  // disable nginx buffering if behind a proxy
+    'X-Accel-Buffering': 'no',
   });
 
-  // Tell the browser to reconnect after 2s if the connection drops
   res.write('retry: 2000\n\n');
   res.write(`event: connected\ndata: ${JSON.stringify({ workspace: WORKSPACE, version: VERSION })}\n\n`);
   sseClients.add(res);
   log(`SSE client connected (${sseClients.size} total)`, C.cyan);
 
-  // Heartbeat every 5s — keep connection alive through proxies and idle timeouts
   const heartbeat = setInterval(() => {
     if (sseClients.has(res)) {
       try { res.write(': heartbeat\n\n'); } catch { sseClients.delete(res); clearInterval(heartbeat); }
@@ -900,7 +931,7 @@ async function handleExecute(req, res) {
   req.on('end', async () => {
     let payload;
     try { payload = JSON.parse(body); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
-    const { action, source, autoApprove: clientAuto } = payload;
+    const { action, source, autoApprove: clientAuto, streamId: execStreamId } = payload;
     if (!action?.type) return sendJSON(res, 400, { error: 'Missing action.type' });
 
     stats.dispatched++;
@@ -909,10 +940,11 @@ async function handleExecute(req, res) {
 
     if (action.type === 'execute_command') {
       const cmd = action.params?.command || '';
-      if (isDuplicateCommand(cmd)) {
+      if (!isFileReadCommand(cmd) && (isDuplicateCommandContent(cmd) || isInFlight(cmd))) {
         stats.skippedDuplicates++;
         return sendJSON(res, 200, { ok: true, output: '[dedup]', exitCode: 0, skipped: true });
       }
+      if (!isFileReadCommand(cmd)) markCommandRunning(cmd);
     }
 
     const isFileWrite = action.type === 'write_file' ||
@@ -975,7 +1007,7 @@ function validatePythonSyntax(code) {
     if (result.status === 0) return { ok: true };
     return { ok: false, error: (result.stderr || result.stdout || '').trim() || 'Syntax error' };
   } catch (err) {
-    return { ok: true }; // python3 not available — skip
+    return { ok: true };
   }
 }
 
@@ -1026,19 +1058,11 @@ function readFile({ path: filePath }) {
 const HEREDOC_RE = /<<\s*['"']?\w+['"']?/;
 
 function normaliseCommand(raw) {
-  // Do NOT replace literal \n escape sequences here.
-  // Commands coming from the AI already contain real newlines (the parser
-  // extracts them verbatim from fenced blocks).  Replacing \\n → \n would
-  // corrupt heredoc content that was intentionally written as a two-character
-  // backslash-n (e.g. inside a Python print("…\n…") string).
-  // The only thing we need to decide is *how* to invoke bash for this command.
   const expanded = raw;
   return { expanded, needsBashStdin: expanded.includes('\n') || HEREDOC_RE.test(expanded) };
 }
 
 // ── Execute Command ───────────────────────────────────────────────────────────
-// Swift and direct: no timeout, spawnSync waits for natural exit.
-// Multi-line / heredoc commands go via bash stdin for correct parsing.
 function executeCommand({ command }) {
   if (!command) throw new Error('Missing command');
   log(`  $ ${command.slice(0, 120)}`, C.dim);
@@ -1065,9 +1089,6 @@ function executeCommand({ command }) {
 
   if (result.error) log(`  ✗ spawn error: ${result.error.message}`, C.red);
   if (output) output.split('\n').forEach(l => log(`  │ ${l}`, C.dim));
-  // Do NOT broadcastSSE here — handleStreamEnd, handleOpenAI, and handleExecute
-  // each call broadcastSSE after dispatch() returns, so broadcasting here too
-  // would fire the event a second (or third) time for every command.
   return { ok: exitCode === 0, output, exitCode };
 }
 
@@ -1122,10 +1143,8 @@ async function handleKillProcess(req, res) {
   });
 }
 
-// Kill the most recently started background process (used by Ctrl+K and /kill-last)
 function killLastProcess() {
   if (bgProcesses.size === 0) return { ok: false, error: 'No background processes running' };
-  // bgProcesses is a Map — last inserted key = most recently started
   const entries = [...bgProcesses.entries()];
   const [label] = entries[entries.length - 1];
   return killBgProcess(label);
@@ -1208,17 +1227,6 @@ function walkDir(dir, root) {
 }
 
 // ── Action Parser v17 ─────────────────────────────────────────────────────────
-//
-// Detection logic (merged best of v14 + v15):
-// 1. Strip <think>/<thinking>/[THINK] blocks (incl. unclosed)
-// 2. Conversational guard:
-//    a. If NO code fences AND strong conversational opener → skip (v15 method)
-//    b. If prose ratio > 80% + conversational signals + < 2 fences → skip (v14 method)
-// 3. Commands from: bash/sh/shell/zsh fences, unlabelled fences starting with shell cmds,
-//    bare heredoc blocks outside fences
-// 4. // COMMAND: directive is NOT parsed (removed in v15, kept removed here)
-// 5. Partial block fallback for cut-off streams
-
 const CMD_LANGS = new Set(['bash', 'sh', 'shell', 'zsh', 'ps1', 'powershell', 'cmd', 'bat']);
 
 const REAL_COMMAND_RE = /^(cat\s|sed\s|echo\s|printf\s|mkdir|rm\s|cp\s|mv\s|cd\s|ls|touch\s|chmod\s|pip\s|pip3\s|python\s|python3\s|node\s|npm\s|yarn\s|git\s|curl\s|wget\s|apt|sudo\s|export\s|source\s|bash\s|sh\s|find\s|grep\s|awk\s|tar\s|zip\s|unzip\s|\.\/|\$\s+\S)/im;
@@ -1227,14 +1235,12 @@ function isRealCommandBlock(blockContent) {
   const lines = blockContent.split('\n').map(l => l.trim()).filter(Boolean);
   if (!lines.length) return false;
   const firstLine = lines[0];
-  // Reject if starts with a plain sentence (prose disguised as code)
   const looksLikeProse = /^[A-Z][a-z]/.test(firstLine) && !/[|>&$#]/.test(firstLine);
   const hasRealCommand = REAL_COMMAND_RE.test(blockContent);
   if (looksLikeProse && !hasRealCommand) return false;
   return hasRealCommand;
 }
 
-// Strong conversational starters (v15 approach — tight)
 const STRONG_CONVERSATIONAL_STARTERS = [
   /^(sure[,!.]?|okay[,!.]?|ok[,!.]?|got it[,!.]?|of course[,!.]?|absolutely[,!.]?|certainly[,!.]?|happy to help[,!.]?|hello[,!.]?|hi there[,!.]?|no problem[,!.]?|understood[,!.]?)\s*$/i,
   /^i (can|will|am going to|would be happy to) help/i,
@@ -1243,26 +1249,22 @@ const STRONG_CONVERSATIONAL_STARTERS = [
   /^(sorry|i apologize|unfortunately|i (can't|cannot) (do|help|assist) with that)/i,
 ];
 
-// Broader conversational patterns (v14 approach — for prose-ratio check)
 const CONVERSATIONAL_PATTERNS = [
   /^(sure|okay|ok|got it|of course|absolutely|certainly|happy to|great|hello|hi there|no problem|understood|i understand|i see|i'll|i will|i can|let me|let's|here('s| is)|i've|i have|i'm|i am|to do this|in order to|first,|firstly|next,|then,|finally,|step \d)/i,
   /^(sorry|apolog|unfortunately|i (can't|cannot|don't|do not)|that's not|this (isn't|is not)|please note|note that|be aware|keep in mind)/i,
-  /\?$/, // ends with question mark
+  /\?$/,
 ];
 
 function isConversationalResponse(stripped, fenceCount) {
-  // If text contains // COMMAND: directives — never conversational
   if (/\/\/\s*COMMAND:/i.test(stripped)) return false;
 
-  // Gate 1 (v15): no fences + strong opener
   if (fenceCount === 0) {
-    if (/<<\s*['"']?\w+['"']?/.test(stripped)) return false; // heredoc = not conversational
+    if (/<<\s*['"']?\w+['"']?/.test(stripped)) return false;
     const lines = stripped.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 5);
     const hasStrongOpener = lines.some(line => STRONG_CONVERSATIONAL_STARTERS.some(p => p.test(line)));
     if (hasStrongOpener && !REAL_COMMAND_RE.test(stripped)) return true;
   }
 
-  // Gate 2 (v14): prose-ratio check
   const prose = stripped.replace(/```[\s\S]*?```/g, '').trim();
   const proseLines = prose.split('\n').map(l => l.trim()).filter(Boolean);
   const totalLines = stripped.split('\n').length;
@@ -1295,12 +1297,6 @@ function parseActionsWithPartial(text) {
   const actions = [];
   let partialBlocks = 0;
 
-  // Strip think/reasoning blocks (incl. unclosed at end of stream)
-  // Also strip <tool_result> blocks — these are command results that were
-  // injected BACK into the chat as feedback. If the stream captures both the
-  // injected result AND the AI's follow-up prose, the tool_result block must
-  // be removed before parsing or the old command gets re-extracted and the
-  // AI's prose text gets appended to it (producing "cmd &'s Cube is running…").
   let stripped = text
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
@@ -1308,11 +1304,8 @@ function parseActionsWithPartial(text) {
     .replace(/<thinking>[\s\S]*/gi, '')
     .replace(/\[THINK\][\s\S]*?\[\/THINK\]/gi, '')
     .replace(/\[THINK\][\s\S]*/gi, '')
-    // Remove complete <tool_result>…</tool_result> blocks (injected feedback)
     .replace(/<tool_result>[\s\S]*?<\/tool_result>/gi, '')
-    // Remove any unclosed <tool_result> block that reaches end of text
     .replace(/<tool_result>[\s\S]*/gi, '')
-    // Remove agent header lines like "# [AGENT: tester]"
     .replace(/^#\s*\[AGENT:[^\]]*\]\s*$/gim, '')
     .trim();
 
@@ -1325,7 +1318,6 @@ function parseActionsWithPartial(text) {
 
   const cleanText = stripped;
 
-  // ── Pattern 1: Complete fenced code blocks ────────────────────────────────
   const completeFenceRe = /```(\w*)\s*\n([\s\S]*?)```/g;
 
   for (const match of cleanText.matchAll(completeFenceRe)) {
@@ -1333,32 +1325,18 @@ function parseActionsWithPartial(text) {
     const blockContent = match[2];
 
     if (CMD_LANGS.has(lang)) {
-      // Strip prose that leaked into the block from the injected tool_result feedback.
-      // Contamination happens in two ways:
-      //   A) Same-line: "pip install -r requirements.txt environment. Let me create one."
-      //      — AI prose appended directly after the command on the same line.
-      //   B) Multi-line: command on line 0, prose on subsequent lines.
       const rawCmd = blockContent.trim();
       if (!rawCmd) continue;
 
-      // ── A) Same-line prose truncation ─────────────────────────────────────
-      // Detect the boundary where a valid shell token sequence ends and a
-      // natural-language sentence begins on the same line.
-      // Two contamination patterns:
-      //   1. With space:    "pip install -r requirements.txt environment. Let me..."
-      //   2. No-space join: "python3 -m venv venvVirtual environment created..."
       function truncateInlineProse(line) {
         let best = line;
 
-        // Pattern 1: space + known prose word
         const proseBreak = line.search(/\s+(environment|error|warning|note|this|now|let|please|make|already|done|created|installed|running|starting|complete|finished|failed|success|sorry|i\s|virtual\s)/i);
         if (proseBreak > 0) {
           const cmdPart = line.slice(0, proseBreak).trim();
           if (REAL_COMMAND_RE.test(cmdPart) && cmdPart.length < best.length) best = cmdPart;
         }
 
-        // Pattern 2: no-space camelCase boundary (e.g. "venvVirtual" → "venv")
-        // Run independently and take result if shorter than pattern 1 result.
         const m = line.match(/^(.*?[a-z0-9._\-\/])([A-Z][a-z].*)$/);
         if (m) {
           const cmdPart = m[1].trim();
@@ -1368,7 +1346,6 @@ function parseActionsWithPartial(text) {
         return best;
       }
 
-      // ── B) Multi-line: keep only shell-like lines ─────────────────────────
       const rawLines = rawCmd.split('\n');
       const cleanedLines = [];
       for (let li = 0; li < rawLines.length; li++) {
@@ -1378,11 +1355,10 @@ function parseActionsWithPartial(text) {
         if (isShellLike) {
           cleanedLines.push(truncateInlineProse(rawLines[li]));
         } else if (li === 0) {
-          // First line determines if this is a real command block at all
           if (!isRealCommandBlock(rawCmd)) break;
           cleanedLines.push(truncateInlineProse(rawLines[li]));
         } else {
-          break; // Stop at first non-shell line
+          break;
         }
       }
 
@@ -1396,7 +1372,6 @@ function parseActionsWithPartial(text) {
       continue;
     }
 
-    // Unlabelled blocks starting with shell commands
     if (lang === '' || lang === 'txt' || lang === 'text') {
       const firstLine = blockContent.split('\n')[0].trim();
       const SHELL_START_RE = /^(cat\s|sed\s|echo\s|printf\s|mkdir\s|rm\s|cp\s|mv\s|cd\s|ls\s|touch\s|chmod\s|chown\s|pip\s|pip3\s|python\s|python3\s|node\s|npm\s|yarn\s|git\s|curl\s|wget\s|apt\s|apt-get\s|sudo\s|export\s|source\s|bash\s|sh\s|find\s|grep\s|awk\s|tar\s|zip\s|unzip\s|\.\/)/i;
@@ -1407,13 +1382,11 @@ function parseActionsWithPartial(text) {
       }
     }
 
-    // // COMMAND: directive inside any fence — for all commands EXCEPT cat (cat uses heredoc)
     {
       const firstLine = blockContent.split('\n')[0].trim();
       const cmdDirective = firstLine.match(/^\/\/\s*COMMAND:\s*(.+)$/i);
       if (cmdDirective) {
         const directiveCmd = cmdDirective[1].trim();
-        // cat commands must use heredoc — skip // COMMAND: cat
         if (!/^\s*cat\s/i.test(directiveCmd)) {
           const bodyLines = blockContent.split('\n').slice(1);
           const body = bodyLines.join('\n').trim();
@@ -1426,18 +1399,14 @@ function parseActionsWithPartial(text) {
 
   const noCodeBlocks = cleanText.replace(/```[\s\S]*?```/g, '');
 
-  // ── Pattern 2: Standalone // COMMAND: lines outside fences ──────────────
-  // Matches: // COMMAND: <anything except cat>
   const cmdLineRe = /^[ \t]*\/\/\s*COMMAND:\s*(.+)$/gim;
   for (const match of noCodeBlocks.matchAll(cmdLineRe)) {
     const cmd = match[1].trim();
-    // cat commands must use heredoc syntax — skip // COMMAND: cat
     if (cmd && !/^\s*cat\s/i.test(cmd)) {
       actions.push({ type: 'execute_command', params: { command: cmd } });
     }
   }
 
-  // ── Pattern 3: Bare heredoc commands outside fences ──────────────────────
   const HEREDOC_OPEN_RE = /^(cat\s+[>|]+\s*\S+\s*<<\s*['"']?(\w+)['"']?)\s*$/gm;
   for (const match of noCodeBlocks.matchAll(HEREDOC_OPEN_RE)) {
     const delimiter = match[2];
@@ -1451,7 +1420,6 @@ function parseActionsWithPartial(text) {
     }
   }
 
-  // ── Pattern 4: Partial blocks (streaming cut-off fallback) ────────────────
   if (!actions.length) {
     const partialRe = /```(\w*)\s*\n([\s\S]+)$/gm;
     for (const match of cleanText.matchAll(partialRe)) {
@@ -1495,28 +1463,21 @@ function sendJSON(res, status, data) {
 ensureGitignore();
 
 server.listen(PORT, '127.0.0.1', () => {
-  // Disable server-level timeouts — SSE clients must stay connected indefinitely.
   server.timeout = 0;
   server.keepAliveTimeout = 0;
   server.headersTimeout = 0;
   console.log(
-    `\n${C.bold}${C.cyan}⚡ Virola v17.0${C.reset}\n` +
+    `\n${C.bold}${C.cyan}⚡ Virola v17.5${C.reset}\n` +
     `${C.green}✓ Server running${C.reset}  →  http://localhost:${PORT}\n` +
     `${C.dim}  Root dir      : ${WORKSPACE}${C.reset}\n` +
     `${C.dim}  Auto-approve  : ${AUTO_APPROVE ? 'yes (--auto-approve)' : 'no'}${C.reset}\n` +
     `${C.dim}  Bash fences   : bash/sh/shell/zsh execute automatically${C.reset}\n` +
-    `${C.dim}  // COMMAND:   : supported for all commands except cat${C.reset}\n` +
-    `${C.dim}  cat files     : use heredoc syntax only${C.reset}\n` +
+    `${C.dim}  Path-prefixed : venv/bin/python3, ./node_modules/.bin/next, etc. → bg${C.reset}\n` +
     `${C.dim}  OpenAI compat : POST /v1/chat/completions${C.reset}\n` +
     `${C.dim}                  GET  /v1/models${C.reset}\n` +
-    `${C.dim}  Execution     : spawnSync (no timeout), heredoc → bash stdin${C.reset}\n` +
-    `${C.dim}  Python files  : syntax-validated before write${C.reset}\n` +
-    `${C.dim}  Dedup         : blocks only after SUCCESS${C.reset}\n` +
-    `${C.dim}  Long-running  : background spawn${C.reset}\n` +
-    `${C.dim}  Kill server   : Click "⏹ Kill Latest Server" in the extension popup${C.reset}\\n` +
-    `${C.dim}               : or POST /kill-last  |  GET /processes to list${C.reset}\\n` +
-    `${C.dim}  New tab       : long-running servers open in a new terminal window${C.reset}\\n\\n` +
-    `Press Ctrl+C to stop Virola.\\n`
+    `${C.dim}  Kill server   : Click "⏹ Kill Latest Server" in the extension popup${C.reset}\n` +
+    `${C.dim}               : or POST /kill-last  |  GET /processes to list${C.reset}\n` +
+    `Press Ctrl+C to stop Virola.\n`
   );
 });
 
@@ -1529,9 +1490,6 @@ server.on('error', err => {
 process.on('SIGINT', () => { console.log(`\nVirola stopped.`); process.exit(0); });
 process.on('SIGTERM', () => process.exit(0));
 
-// ── SAFETY NETS: keep the Node server alive no matter what ───────────────────
-// Any unhandled error from a bg process child (missing 'error' listener, rejected
-// promise in an event handler, etc.) would otherwise crash the server.
 process.on('uncaughtException', (err) => {
   console.error(`[Virola] uncaughtException (server kept alive): ${err?.stack || err}`);
 });

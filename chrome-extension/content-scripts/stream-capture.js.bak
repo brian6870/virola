@@ -49,8 +49,9 @@
   // How long to suppress new stream-starts after firing stream-end.
   // Must be longer than the full tool_result injection + AI "thinking" startup
   // cycle (~800ms inject + up to 8s for AI to begin responding).
-  // 3s covers the tool_result inject cycle; previous 12s was blocking fast follow-ups.
-  const STREAM_COOLDOWN_MS = 3_000; // 3s: enough to cover inject + ACK, short enough not to miss fast follow-up responses
+  // 12s ensures the injected tool_result and the AI's ACK message don't
+  // re-capture the same command text as a new stream.
+  const STREAM_COOLDOWN_MS = 12_000;
 
   // ── Timers ───────────────────────────────────────────────────────────────────
   let debounceTimer = null;
@@ -226,10 +227,8 @@
 
       if (!isAIEndpoint) return response;
 
-      // If a previous fetch capture is still active, terminate it and take over.
-      // A new AI fetch always means a new stream — silently dropping it caused
-      // short/fast responses to be missed entirely.
-      activeFetchCapture = false;
+      // Don't double-capture if already capturing
+      if (activeFetchCapture) return response;
 
       const clone = response.clone();
       activeFetchCapture = true;
@@ -405,7 +404,7 @@
     stabilityRound = 0;
     lastStableText = lastSeenText;
 
-    // 2 rounds at 150ms = 300ms total stability required
+    // 2 rounds at 300ms = 600ms total stability required (fast!)
     stabilityCheckTimer = setInterval(() => {
       const currentText = getLatestAssistantMessage();
 
@@ -424,17 +423,17 @@
         lastSeenText = currentText;
         scheduleDebounce();
       }
-    }, 150);
+    }, 300);
   }
 
   // ── Schedule debounce ───────────────────────────────────────────────────────
-  // 250ms debounce — resets on every text change. Total fire latency: 250+300=550ms max.
+  // 800ms debounce - resets on EVERY text change (was 3000ms — too slow)
   function scheduleDebounce() {
     clearAllTimers();
 
     debounceTimer = setTimeout(() => {
       scheduleStabilityCheck();
-    }, 250);
+    }, 800);
   }
 
   // ── FIRE STREAM END (only once!) ─────────────────────────────────────────────
@@ -467,7 +466,7 @@
     // injected tool_result prose appended onto the previous message's code block.
     // Always trust rawMarkdownBuffer when it has real content.
     const rawIsClean = rawMarkdownBuffer &&
-      rawMarkdownBuffer.length > 5 &&
+      rawMarkdownBuffer.length > 20 &&
       !/<tool_result>/i.test(rawMarkdownBuffer);
     const rawBest = rawIsClean ? rawMarkdownBuffer : accumulatedText;
 
@@ -504,27 +503,21 @@
     });
 
     // Reset state for next stream.
-    // CRITICAL: set lastSeenText to the CURRENT DOM text — NOT to bestFullText.
-    //
-    // bestFullText is raw markdown (has ```, code fences, etc).
-    // The poll calls getLatestAssistantMessage() which reads RENDERED DOM text
-    // (no fences — the browser strips them). These two strings never match, so
-    // using bestFullText as lastSeenText leaves a permanent mismatch: every
-    // poll tick sees a "new" text and tries to restart the stream, relying
-    // entirely on STREAM_COOLDOWN_MS to block it.
-    //
-    // By pinning lastSeenText to the actual DOM text right now, the poll sees
-    // zero diff on the next tick and stays silent indefinitely — no cooldown
-    // needed to prevent re-triggering from static DOM content.
-    const domTextNow = getLatestAssistantMessage();
-    lastSeenText = domTextNow || accumulatedText; // accumulatedText fallback if DOM not ready
+    // CRITICAL: do NOT clear lastSeenText to ''.
+    // The 500ms poll reads the DOM continuously. If lastSeenText is cleared,
+    // the completed AI message still sitting in the DOM looks "new" to the
+    // poll, which calls processTextChange() again and starts a brand-new
+    // stream from the static text — re-firing the same commands.
+    // Instead, keep lastSeenText as the final completed text so the poll
+    // sees no diff and stays silent until a genuinely new AI message appears.
+    lastSeenText = bestFullText;  // ← hold the completed text, not ''
     accumulatedText = '';
     rawMarkdownBuffer = '';     // clear for next stream
     currentStreamId = null;
     tokenCount = 0;
     pinnedStreamElement = null; // release element pin for next stream
 
-    console.log('[Virola] Stream reset complete, lastSeenText pinned to DOM text (' + lastSeenText.length + ' chars).');
+    console.log('[Virola] Stream reset complete, lastSeenText pinned to completed text (not cleared).');
   }
 
   // ── Parse actions from text ──────────────────────────────────────────────────
@@ -695,17 +688,14 @@
   function checkStreamComplete() {
     if (!isStreaming || streamEndFired) return;
 
-    // If AI is still generating, bail — more text is coming
-    if (CONFIG.isGenerating()) return;
-
-    // AI stopped generating. If no debounce is already running, start one now.
-    // This is the key path for fast/short responses: the MutationObserver sees
-    // the stop indicator disappear and immediately schedules the end — we don't
-    // wait for the next text-change event which may never come for short replies.
-    if (!debounceTimer && !stabilityCheckTimer) {
-      console.log('[Virola] AI stopped generating, scheduling stream end');
-      scheduleDebounce();
+    // Check if AI is still generating
+    if (CONFIG.isGenerating()) {
+      return; // Still generating, don't fire
     }
+
+    // AI stopped generating - trigger the flow
+    console.log('[Virola] AI stopped generating, initiating debounce');
+    scheduleDebounce();
   }
 
   // ── Message listener (from background) ─────────────────────────────────────
@@ -769,7 +759,7 @@
     }
   }, 500);
 
-  console.log(`[Virola v17.4] Stream capture active for ${PLATFORM} - debounce: 250ms, stability: 2×150ms, cooldown: 3s`);
+  console.log(`[Virola v16.0] Stream capture active for ${PLATFORM} - debounce: 800ms, stability: 2×300ms`);
   console.log('[Virola] fetch() intercepted for raw markdown capture');
   console.log('[Virola] inject-loop guard: isInjecting lock active');
   console.log('[Virola] Bash fences auto-execute — no // COMMAND: prefix needed');
