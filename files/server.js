@@ -1,5 +1,28 @@
 #!/usr/bin/env node
-// ─── Virola Server v17.5 ────────────────────────────────────────────────────
+// ─── Virola Server v18.3 ────────────────────────────────────────────────────
+//
+// FIXES v18.2:
+// - parseActionsWithPartial: heredoc commands (cat > file << 'EOF' ... EOF)
+//   are now fast-pathed before the shell-like line filter. Previously, Go/Rust/
+//   Java etc. lines containing 'if ', 'for ', '}', '{' matched the isShellLike
+//   regex, causing the filter to accumulate Go code into the command string.
+//   The resulting 100+ char blob then triggered the long-running heuristic and
+//   the heredoc was spawned as a background process instead of executing.
+//   Fix: detect << EOF on the first line and pass rawCmd through unchanged.
+// - isLongRunningCommand: WRITE_LIKE_CMD_RE also exempts tee, sed -i, cp, mv,
+//   mkdir, touch, chmod, rsync, dd etc. from the long-command heuristic
+//   (v18.1 only exempted cat > heredocs via isFileWriteCommand).
+//
+// - stream-end: instead of immediately returning 400 on empty text, polls
+//   activeStreams for up to 2s (100ms ticks) to recover late-arriving chunks.
+//   Fixes "no text detected" errors for short/fast commands that race with
+//   the stream-end POST from the extension.
+// - isLongRunningCommand: added LONG_RUNNING_DOT_SLASH_RE — detects ./server,
+//   ./run, ./app, ./start etc. executed directly (any compiled language binary
+//   or script with a server-like name), so they spawn as background processes.
+// - isLongRunningCommand: added long-command heuristic — any single segment
+//   ≥100 chars that isn't a file-read command is treated as a background
+//   process candidate (covers exotic launchers not caught by named regexes).
 //
 // FIXES v17.5 (path-prefixed interpreter detection):
 // - LONG_RUNNING_PYTHON_RE now matches venv/bin/python3, .venv/bin/python,
@@ -61,7 +84,7 @@ const hasFlag = flag => args.includes(flag);
 const PORT = parseInt(getArg('--port', '3172'), 10);
 const BASE_DIR = path.resolve(getArg('--dir', path.join(__dirname, '..')));
 const AUTO_APPROVE = hasFlag('--auto-approve');
-const VERSION = '17.5.0';
+const VERSION = '18.3.0';
 
 // ── Root Workspace ────────────────────────────────────────────────────────────
 const WORKSPACE = BASE_DIR;
@@ -309,6 +332,12 @@ const LONG_RUNNING_OTHER_RE = /^\s*((\S*\/)?(nginx|apache2|httpd|caddy\s+run|tra
 // It is intentionally broad — placed LAST so specific regexes above take priority.
 const LONG_RUNNING_SCRIPT_RE = /^\s*\S+\/(\S+\.)?(py|js|ts|rb|php|exs|hs|kts|scala|dart)\s*$/i;
 
+// Detect ./server, ./run, ./start, ./app etc. in any language
+const LONG_RUNNING_DOT_SLASH_RE = /^\s*\.\/(server|app|run|start|serve|main|index|boot|launch|daemon|worker|api|web|http|grpc|ws|gateway|proxy|relay|svc|service)(\.\w+)?\b/i;
+
+// Very long commands (100+ chars) that aren't simple file reads are likely bg processes
+const LONG_COMMAND_THRESHOLD = 100;
+
 // Strip leading KEY=VALUE env-var assignments so "PORT=8081 go run ." is detected correctly.
 function stripLeadingEnvVars(s) {
   return s.replace(/^(\s*[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '').trimStart();
@@ -320,6 +349,9 @@ function isLongRunningCommand(cmd) {
     if (/&\s*$/.test(seg)) return true;
     // Strip trailing & then strip any leading KEY=VALUE env assignments before matching
     const s = stripLeadingEnvVars(seg.replace(/\s*&\s*$/, ''));
+    // Very long single-segment commands (no pipe/chain) are likely bg processes.
+    // Exempt file reads AND file writes (cat heredocs are long but not servers).
+    if (s.length >= LONG_COMMAND_THRESHOLD && !isFileReadCommand(s) && !isWriteLikeCommand(s)) return true;
     return (
       LONG_RUNNING_PYTHON_RE.test(s) ||
       LONG_RUNNING_DIRECT_RE.test(s) ||
@@ -342,6 +374,7 @@ function isLongRunningCommand(cmd) {
       LONG_RUNNING_DART_RE.test(s) ||
       LONG_RUNNING_DB_RE.test(s) ||
       LONG_RUNNING_OTHER_RE.test(s) ||
+      LONG_RUNNING_DOT_SLASH_RE.test(s) ||  // ./server, ./run, ./app etc. any language
       LONG_RUNNING_SCRIPT_RE.test(s)   // catch-all — must be last
     );
   });
@@ -627,7 +660,7 @@ function handleHealth(res) {
     processes.push({ label, pid: entry.pid, uptimeMs: Date.now() - entry.startTime });
   }
   sendJSON(res, 200, {
-    ok: true, tool: 'virola-v17', version: VERSION, stats,
+    ok: true, tool: 'virola-v18', version: VERSION, stats,
     workspace: WORKSPACE, baseDir: BASE_DIR, autoApprove: AUTO_APPROVE,
     extensionClients: sseClients.size,
     backgroundProcesses: processes
@@ -669,20 +702,10 @@ async function handleOpenAI(req, res) {
     for (const action of actions) {
       if (action.type !== 'execute_command') continue;
       const cmd = action.params?.command || '';
-      if (isFileReadCommand(cmd)) {
-        // always run
-      } else {
-        if (isDuplicateCommandContent(cmd) || isInFlight(cmd)) {
-          commandOutputs.push({ cmd, output: '[dedup]', exitCode: 0 }); continue;
-        }
-        markCommandRunning(cmd);
-      }
-
       log(`  $ ${cmd.slice(0, 100)}`, C.dim);
       try {
         const result = await dispatch(action);
         const exitCode = result.exitCode ?? 0;
-        if (exitCode === 0) { markPipSucceeded(cmd); markPythonSucceeded(cmd); markCommandSucceeded(cmd); }
         commandOutputs.push({ cmd, output: result.output || '', exitCode, background: result.background || false });
         broadcastSSE('command_result', { command: cmd, output: result.output || '', exitCode });
         stats.succeeded++;
@@ -770,10 +793,14 @@ function handleStreamChunk(req, res) {
     stats.chunksReceived++;
     let stream = activeStreams.get(streamId);
     if (!stream) {
-      stream = { chunks: [], latestFullText: '', startTime: Date.now(), language };
+      stream = { chunks: [], deltaBuffer: '', latestFullText: '', startTime: Date.now(), language };
       activeStreams.set(streamId, stream);
     }
 
+    // Always append raw delta to server-side buffer for reliable reconstruction
+    if (typeof text === 'string') {
+      stream.deltaBuffer = (stream.deltaBuffer || '') + text;
+    }
     stream.chunks.push({ text, type, language, timestamp });
     if (accumulatedText && accumulatedText.length > (stream.latestFullText || '').length) {
       stream.latestFullText = accumulatedText;
@@ -799,25 +826,43 @@ async function handleStreamEnd(req, res) {
     stats.streamsReceived++;
 
     const stream = activeStreams.get(streamId);
-    let reconstructedText;
+    // Resolution order: longest of fullText, snapshot, or server-side delta buffer
+    const candidates = [
+      fullText,
+      stream?.latestFullText,
+      stream?.deltaBuffer,
+    ].filter(t => typeof t === 'string' && t.length > 0);
+    candidates.sort((a, b) => b.length - a.length);
+    let reconstructedText = candidates[0];
 
-    const chunkDeltaText = stream && stream.chunks.length > 0
-      ? stream.chunks.map(c => c.text).join('') : '';
-    const snapshotText = stream?.latestFullText || '';
-
-    if (fullText && fullText.length > 0) {
-      reconstructedText = fullText;
-      log(`${C.green}stream complete${C.reset} (fullText: ${fullText.length} chars)`);
-    } else if (snapshotText.length > 0) {
-      reconstructedText = snapshotText;
-      log(`${C.green}stream complete${C.reset} (snapshot: ${snapshotText.length} chars)`);
-    } else if (chunkDeltaText.length > 0) {
-      reconstructedText = chunkDeltaText;
-      log(`${C.yellow}stream complete${C.reset} (delta: ${stream.chunks.length} chunks)`);
-    } else {
-      log(`${C.yellow}stream-end: no text found${C.reset}`);
-      return sendJSON(res, 200, { ok: true, actions: [], fullText: '' });
+    if (!reconstructedText) {
+      // Short commands / fast streams sometimes fire stream-end before the last
+      // chunk arrives (race between SSE events and the stream-end POST).
+      // Instead of immediately returning 400, wait up to 2s for chunks to land.
+      const waited = await new Promise(resolve => {
+        let elapsed = 0;
+        const POLL_MS = 100;
+        const MAX_WAIT_MS = 2000;
+        const interval = setInterval(() => {
+          elapsed += POLL_MS;
+          const s = activeStreams.get(streamId);
+          const delta = s?.deltaBuffer || '';
+          const latest = s?.latestFullText || '';
+          const best = delta.length >= latest.length ? delta : latest;
+          if (best.length > 0 || elapsed >= MAX_WAIT_MS) {
+            clearInterval(interval);
+            resolve(best || '');
+          }
+        }, POLL_MS);
+      });
+      if (!waited) {
+        log(`${C.red}stream-end: no text available for streamId=${streamId} after wait — returning 400${C.reset}`);
+        return sendJSON(res, 400, { error: 'no_text_found', message: 'No text received yet. Retry stream-end.' });
+      }
+      log(`${C.yellow}stream-end: recovered text after wait (${waited.length} chars)${C.reset}`);
+      reconstructedText = waited;
     }
+    log(`${C.green}stream complete${C.reset} (${reconstructedText.length} chars, streamId=${streamId})`);
 
     if (stream) activeStreams.delete(streamId);
 
@@ -836,14 +881,7 @@ async function handleStreamEnd(req, res) {
     for (const action of actions) {
       stats.dispatched++;
 
-      if (action.type === 'execute_command') {
-        const cmd = action.params?.command || '';
-        if (!isFileReadCommand(cmd) && (isDuplicateCommandContent(cmd) || isInFlight(cmd))) {
-          stats.skippedDuplicates++;
-          results.push({ action, result: { ok: true, output: '[dedup]', exitCode: 0, skipped: true } }); continue;
-        }
-        if (!isFileReadCommand(cmd)) markCommandRunning(cmd);
-      }
+      // dedup removed in v18 — every action executes
 
       const isFileWrite = action.type === 'write_file' ||
         (action.type === 'execute_command' && isFileWriteCommand(action.params?.command || ''));
@@ -860,7 +898,6 @@ async function handleStreamEnd(req, res) {
 
         if (action.type === 'execute_command') {
           const cmd = action.params?.command || '';
-          markCommandFinished(cmd);
           if (result.background) {
             broadcastSSE('command_result', {
               command: cmd,
@@ -883,7 +920,6 @@ async function handleStreamEnd(req, res) {
         results.push({ action, error: err.message });
         log(`  ✗ ${action.type}: ${err.message}`, C.red);
         if (action.type === 'execute_command') {
-          markCommandFinished(action.params?.command || '');
           broadcastSSE('command_result', { command: action.params?.command, output: err.message, exitCode: 1 });
         }
       }
@@ -897,6 +933,7 @@ async function handleStreamEnd(req, res) {
 function handleSSE(req, res) {
   req.socket.setTimeout(0);
   req.socket.setKeepAlive(true, 1000);
+  req.socket.setNoDelay(true);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -906,21 +943,29 @@ function handleSSE(req, res) {
     'X-Accel-Buffering': 'no',
   });
 
-  res.write('retry: 2000\n\n');
+  // retry: 1000ms — browser reconnects fast if TCP actually drops
+  res.write('retry: 1000\n\n');
   res.write(`event: connected\ndata: ${JSON.stringify({ workspace: WORKSPACE, version: VERSION })}\n\n`);
   sseClients.add(res);
   log(`SSE client connected (${sseClients.size} total)`, C.cyan);
 
+  // Heartbeat every 3s — defeats NAT/proxy idle-timeout drops
   const heartbeat = setInterval(() => {
-    if (sseClients.has(res)) {
-      try { res.write(': heartbeat\n\n'); } catch { sseClients.delete(res); clearInterval(heartbeat); }
-    } else clearInterval(heartbeat);
-  }, 5000);
+    try {
+      res.write(': heartbeat\n\n');
+    } catch {
+      // Write failed — TCP truly gone, clean up
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+      log(`SSE client write-failed, removed (${sseClients.size} remaining)`, C.dim);
+    }
+  }, 3000);
 
+  // On 'close': only stop the heartbeat. Do NOT remove from sseClients.
+  // broadcastSSE prunes naturally on write failure.
   req.on('close', () => {
-    sseClients.delete(res);
     clearInterval(heartbeat);
-    log(`SSE client disconnected (${sseClients.size} remaining)`, C.dim);
+    log(`SSE socket closed (client kept, size=${sseClients.size})`, C.dim);
   });
 }
 
@@ -938,36 +983,20 @@ async function handleExecute(req, res) {
     log(`← ${source || '?'} | ${C.cyan}${action.type}${C.reset}`);
     const shouldAuto = AUTO_APPROVE || clientAuto || global._sessionAutoApprove;
 
-    if (action.type === 'execute_command') {
-      const cmd = action.params?.command || '';
-      if (!isFileReadCommand(cmd) && (isDuplicateCommandContent(cmd) || isInFlight(cmd))) {
-        stats.skippedDuplicates++;
-        return sendJSON(res, 200, { ok: true, output: '[dedup]', exitCode: 0, skipped: true });
-      }
-      if (!isFileReadCommand(cmd)) markCommandRunning(cmd);
-    }
-
     const isFileWrite = action.type === 'write_file' ||
       (action.type === 'execute_command' && isFileWriteCommand(action.params?.command || ''));
     if (!shouldAuto && !isFileWrite) {
       const allowed = await promptConfirm(action);
-      if (!allowed) {
-        if (action.type === 'execute_command') markCommandFinished(action.params?.command || '');
-        stats.failed++; return sendJSON(res, 200, { error: 'User cancelled' });
-      }
+      if (!allowed) { stats.failed++; return sendJSON(res, 200, { error: 'User cancelled' }); }
     }
 
     try {
       const result = await dispatch(action);
       stats.succeeded++;
-      if (action.type === 'execute_command') {
-        markCommandFinished(action.params?.command || '');
-      }
       broadcastSSE('action_result', { type: action.type, params: action.params, result });
       sendJSON(res, 200, result);
     } catch (err) {
       stats.failed++;
-      if (action.type === 'execute_command') markCommandFinished(action.params?.command || '');
       sendJSON(res, 200, { error: err.message });
     }
   });
@@ -1043,6 +1072,12 @@ async function writeFileLive({ path: filePath, content }) {
 const FILE_WRITE_CMD_RE = /^\s*cat\s+[>|]+/i;
 function isFileWriteCommand(cmd) { return FILE_WRITE_CMD_RE.test(cmd.trim().split('\n')[0]); }
 
+// Broader write-like command check used only by the long-command bg heuristic.
+// isFileWriteCommand covers cat heredocs; this also covers other common writes
+// that produce long command strings but are not servers.
+const WRITE_LIKE_CMD_RE = /^\s*(cat\s+[>|]|tee\s|sed\s+-i|cp\s+|mv\s+|mkdir\s+|touch\s+|chmod\s+|chown\s+|ln\s+|dd\s+|rsync\s+|echo\s+.*[>]|printf\s+.*[>]|install\s+|tar\s+(c|x))/i;
+function isWriteLikeCommand(cmd) { return WRITE_LIKE_CMD_RE.test(cmd.trim().split('\n')[0]); }
+
 // ── Read File ─────────────────────────────────────────────────────────────────
 function readFile({ path: filePath }) {
   const abs = resolvePath(filePath);
@@ -1070,7 +1105,7 @@ function executeCommand({ command }) {
   const isWin = process.platform === 'win32';
   const { expanded, needsBashStdin } = normaliseCommand(command);
 
-  if (!isWin && isLongRunningCommand(expanded)) {
+  if (!isWin && !HEREDOC_RE.test(expanded) && isLongRunningCommand(expanded)) {
     log(`  [long-running → background]`, C.dim);
     return spawnBackground(expanded);
   }
@@ -1346,6 +1381,19 @@ function parseActionsWithPartial(text) {
         return best;
       }
 
+      // Heredoc commands (cat > file << 'EOF' ... EOF) must be passed through
+      // as-is. The shell-like line filter below would falsely include Go/Rust/
+      // other language lines that start with if/for/}/{ and build a garbled
+      // multi-line command that then trips the long-running heuristic.
+      const firstRawLine = rawCmd.split('\n')[0];
+      if (/<<\s*['"]?EOF['"]?\s*$/i.test(firstRawLine)) {
+        // Pass the full heredoc block straight through — no line filtering.
+        if (rawCmd && isRealCommandBlock(rawCmd)) {
+          actions.push({ type: 'execute_command', params: { command: rawCmd } });
+        }
+        continue;
+      }
+
       const rawLines = rawCmd.split('\n');
       const cleanedLines = [];
       for (let li = 0; li < rawLines.length; li++) {
@@ -1467,7 +1515,7 @@ server.listen(PORT, '127.0.0.1', () => {
   server.keepAliveTimeout = 0;
   server.headersTimeout = 0;
   console.log(
-    `\n${C.bold}${C.cyan}⚡ Virola v17.5${C.reset}\n` +
+    `\n${C.bold}${C.cyan}⚡ Virola v${VERSION}${C.reset}\n` +
     `${C.green}✓ Server running${C.reset}  →  http://localhost:${PORT}\n` +
     `${C.dim}  Root dir      : ${WORKSPACE}${C.reset}\n` +
     `${C.dim}  Auto-approve  : ${AUTO_APPROVE ? 'yes (--auto-approve)' : 'no'}${C.reset}\n` +
