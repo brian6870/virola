@@ -1,18 +1,1 @@
 
-# virola-managed
-server.js
-package.json
-package-lock.json
-node_modules/
-.vibeignore
-README.md
-CODE_EXPLANATION.md
-chrome-extension/
-background.js
-manifest.json
-popup.html
-popup.js
-core.js
-content-scripts/
-prompt.md
-VIROLA_SYSTEM_PROMPT.md
